@@ -105,14 +105,59 @@ belonging to someone else and give it a key, that party receives the key. The co
 legitimate server from a hostile one; it only refuses to leak an *environment* key to an unknown
 host. Treat a custom base URL as you would any other place you type a credential.
 
+### Complete inventory of outbound paths (first-party source)
+
+Found by searching `crates/`, `apps/` and `xtask/` for every route to the network, not by reading
+the AI code alone. Re-run these to check it yourself.
+
+| Route | How it was searched | Result |
+|---|---|---|
+| HTTP clients | `ureq`, `reqwest`, `hyper`, `curl`, `isahc`, `surf`, `attohttpc`, `minreq` in `Cargo.lock` and every `Cargo.toml` | Only `ureq` 3 (rustls + webpki-roots), declared by `crates/ai` and `crates/engines` only. No async runtime or HTTP stack of our own. |
+| `ureq` call sites | `.get(` / `.post(` / `.call(` / `.send(` | Six, all listed below. |
+| Raw sockets | `std::net`, `TcpStream`, `TcpListener`, `UdpSocket`, `ToSocketAddrs` | Loopback servers and probes (preview, stand-in, Ghidra, Cutter, CDP, JEB), plus `detect.rs` port probes of hosts you configure. `formats/src/pcap.rs` only *parses* capture files. |
+| Shelling out to a downloader | `curl`, `wget`, `Invoke-WebRequest`, `Invoke-RestMethod`, `DownloadFile`, `certutil`, `bitsadmin`, `nc` | None. Every `powershell` call is local: keep-awake, end a process tree, `Get-AuthenticodeSignature`. |
+| Programs spawned | every `Process::new("…")` / `Command::new("…")` literal | `git`, `cargo`, `ssh`, `sh`, `cmd`, `powershell`, `caffeinate`, `xcrun`, `tasklist`, `ps`, `sleep`, plus agent CLIs and browsers you choose. |
+| Browser build | `fetch`, `XmlHttpRequest`, `WebSocket`, `sendBeacon` in `apps/craft-anything-web` | None. It reads one local file you pick. |
+| UI image loading | `egui_extras` features | `svg` only. The `http` loader is off, so the UI cannot fetch an image from a URL. |
+| Telemetry | `telemetry`, `analytics`, `sentry`, `posthog`, `mixpanel`, `amplitude`, `update_check` | None (only detection tables and Aider's `--no-analytics`). |
+| Runtime-built URLs | `format!("https://…")`, `format!("{scheme}://…")` | The website target you type (`ui-egui/src/make.rs`), the Godot download (`engines/src/game.rs`), loopback test servers, and parsers of captured data. No URL is assembled from file contents or secrets. |
+| Build scripts | all `build.rs` | Three; font embedding and Windows resources, no network. |
+
+The six `ureq` call sites and where each URL comes from:
+
+| File | Destination | Carries |
+|---|---|---|
+| `ai/src/http.rs` (POST, GET) | the model backend you configured, or a pinned provider host (`api.openai.com`, `api.anthropic.com`, `openrouter.ai`, Gemini, `opencode.ai`, plus rows in `providers.rs`: DeepSeek, Moonshot, Z.ai, xAI, Together, Mistral, Groq, Fireworks, DeepInfra) | your prompt, tool results, and that backend's key |
+| `engines/src/install.rs` | pinned `https://` URLs in `engines/src/table.rs`: `dl.google.com`, `github.com` releases (Vineflower, Rizin, Apktool, JADX, Ghidra, Temurin) | nothing; GET, SHA-256 checked |
+| `engines/src/game.rs` via `download_to` | `github.com/godotengine/godot` releases; Unity, Epic and Visual Studio download pages | nothing; GET |
+| `engines/src/assets/fal.rs` | `https://fal.run/{model}`, then the file URL fal returns | your prompt and fal key; the key goes to `fal.run` only |
+| `engines/src/mcp_client.rs` | a plugin URL you added; `https://` or loopback only | tool arguments, and headers you set |
+| `engines/src/cutter.rs` | `http://127.0.0.1:{port}` | local only |
+
+Hostnames elsewhere in the source (`example.test`, `x.test`, `app.test`, `192.168.1.20`,
+`attacker.example`, `evil.com`, schema namespaces and so on) are test fixtures, documentation
+examples, or parser sample data, not connections. `registry.npmjs.org` appears only in a unit-test
+`.npmrc`, `www.apple.com` only in plist DTD strings, and `fonts.googleapis.com` only in a regex
+that recognises fonts in a page being studied.
+
+Two outbound headers identify the *app*, not you: `HTTP-Referer: https://github.com/storytold/craft-anything`
+and `X-Title: Craft Anything` on OpenRouter calls, and `x-opencode-session` (a random local id) on
+OpenCode Go calls.
+
+Two things leave your machine by design and are worth knowing: the website you ask it to study (a
+launched Chromium visits it), and everything a coding-agent CLI you choose (Claude Code, Copilot,
+and so on) sends under its own terms. This tool starts those programs; it does not control their
+networking.
+
 ### What this review cannot prove
 
 "Absolutely positive" is not a claim a source review can honestly make. What was established, and
 what was not:
 
-- **Established:** in first-party source at `1f8508a`, every code path that sends a key was read,
-  and each goes to a user-configured base URL or a pinned vendor host. No telemetry or
-  credential-store access exists in that source.
+- **Established:** in first-party source (`crates/`, `apps/`, `xtask/`; audited at `1f8508a`,
+  inventory re-run at `405de80`), every route to the network is listed above, and each goes to a
+  user-configured base URL or a pinned vendor host. No telemetry or credential-store access
+  exists in that source.
 - **Not established — third-party crates.** `Cargo.lock` pins hundreds of crates.io dependencies;
   they were checked for source (crates.io only, no git deps) but not read line by line. A
   compromised dependency release is the realistic route for exfiltration in any Rust project.
