@@ -121,7 +121,7 @@ the AI code alone. Re-run these to check it yourself.
 | UI image loading | `egui_extras` features | `svg` only. The `http` loader is off, so the UI cannot fetch an image from a URL. |
 | Telemetry | `telemetry`, `analytics`, `sentry`, `posthog`, `mixpanel`, `amplitude`, `update_check` | None (only detection tables and Aider's `--no-analytics`). |
 | Runtime-built URLs | `format!("https://…")`, `format!("{scheme}://…")` | The website target you type (`ui-egui/src/make.rs`), the Godot download (`engines/src/game.rs`), loopback test servers, and parsers of captured data. No URL is assembled from file contents or secrets. |
-| Build scripts | all `build.rs` | Three; font embedding and Windows resources, no network. |
+| Build scripts | all `build.rs`, including `vendor/` | Four: font embedding, Windows resources (two apps), and the vendored `wgpu-hal`'s `cfg_aliases` block. None touch the network. (An earlier revision of this report omitted the vendored one.) |
 
 The six `ureq` call sites and where each URL comes from:
 
@@ -201,8 +201,34 @@ environment, because child processes inherit the environment (finding 4).
 - The only vendored crate is `vendor/wgpu-hal`, patched solely for Metal MSL version probing and
   documented in `vendor/wgpu-hal/CRAFT_ANYTHING.md`. It was scanned for process, network,
   environment, and credential calls and contains none.
-- Build scripts exist only in `crates/ui-egui` (optional `CRAFT_FONTS_DIR` embedding) and the two
-  app crates (Windows icon and manifest via `winresource`).
+- First-party build scripts: `crates/ui-egui` (optional `CRAFT_FONTS_DIR` embedding), the two app
+  crates (Windows icon and manifest via `winresource`), and the vendored `wgpu-hal`
+  (`cfg_aliases` only). All four were read; none do I/O beyond the build.
+
+### Cargo configuration: what runs when you build
+
+Building runs code before the app ever starts, so the manifests were checked for anything that
+changes *what* gets built or *what runs* at build time.
+
+- **`.cargo/config.toml`** contains one line, an alias (`xtask = "run --quiet --package xtask --"`).
+  No `rustflags`, no `runner`, no `linker`, no source replacement, no registry override.
+- **Root `Cargo.toml`:** a workspace of local path crates, release-profile settings, and a single
+  `[patch.crates-io]` that points `wgpu-hal` at the local `vendor/wgpu-hal` copy (documented in
+  `vendor/wgpu-hal/CRAFT_ANYTHING.md`). No `[replace]`, no git dependency, no alternative registry.
+- **No `rust-toolchain` file**, so nothing selects a toolchain for you.
+- **Member manifests:** no git, branch, rev or registry dependencies anywhere. The only
+  `[build-dependencies]` are `winresource` (two apps) and `cfg_aliases` (vendored). `xtask`
+  depends on `syn` and `proc-macro2` for its own source scans.
+- **`deny.toml`** sets `unknown-registry = "deny"` and `unknown-git = "deny"`, so `cargo deny
+  check` would fail the build on either.
+
+**What this does not cover.** Every crate in the dependency tree may ship its own `build.rs`, and
+procedural macros are compiled and run by the compiler. Both execute arbitrary code with your user
+privileges during `cargo build` or `cargo install`, and neither is visible from this repo's
+manifests. `Cargo.lock` pins versions and checksums, and `--locked` makes cargo refuse to deviate
+from it, which protects against a *later* tampered release but not against a crate that was
+malicious when locked. To reduce that risk: build with `--locked`, run `cargo deny check` and
+`cargo audit`, and for a high-stakes machine build inside a VM or container with no keys present.
 - `.githooks/pre-commit` runs `cargo xtask secrets`, which scans staged files for secret-shaped
   values and for this machine's own environment values.
 
