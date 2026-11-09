@@ -3,11 +3,12 @@
 A read-only audit of this repository, answering one question: **does this code try to compromise
 the user's API keys, their machine, or anything else?**
 
-Scope: the whole workspace at `1f8508a` — `crates/`, `apps/`, `xtask/`, `vendor/`, build scripts,
-and the dependency manifest. Method: reading the source, not running it against a live provider.
-Two builds were run to confirm the tree compiles (`cargo build -p craft-anything-cli` and
-`cargo build -p craft-anything`), and the CLI was exercised (`doctor`, `capabilities`, `triage`,
-`ai detect`).
+Scope: the whole workspace at `35e580e` — `crates/`, `apps/`, `xtask/`, `vendor/`, build scripts,
+the dependency manifest, and the dependency tree itself. Method: reading the source, plus the
+tooling this review previously only recommended. `cargo audit` and `cargo deny check` were run
+against the real lockfile, every dependency build script and proc-macro was scanned, and the
+lockfile was updated to clear what could be cleared. Two builds were run to confirm the tree
+compiles after the update.
 
 ## Verdict
 
@@ -16,9 +17,13 @@ check, and no credential harvesting. Keys are stored in the OS keychain, are nev
 tool, and are redacted from journals and evidence. Every outbound request goes to a host the user
 configured or a pinned vendor URL, over TLS with certificate validation that cannot be turned off.
 
-The real risks are **design** risks, not deception: a builder agent you point at this tool can act
-with your full user privileges, and child processes inherit your environment. Those are documented
-below as findings, because a user should know them before running a build.
+**But the TLS stack was out of date, and that is the most important change since the last review.**
+`cargo audit` found two live vulnerabilities in the certificate-verification path that every
+connection uses. Both are fixed in this branch by a lockfile update. Details in finding 9.
+
+The real risks remain **design** risks, not deception: a builder agent you point at this tool can
+act with your full user privileges, and child processes inherit your environment. Those are
+documented below as findings, because a user should know them before running a build.
 
 ## Findings
 
@@ -27,13 +32,56 @@ below as findings, because a user should know them before running a build.
 | 1 | 🟠 HIGH | `crates/ai/src/cli_agents/adapters/antigravity.rs` | 4, 17–19 | Builder mode passes `--dangerously-skip-permissions`, and the adapter has no `validate_access` override, so Clean room is not enforced. Grok and Aider both refuse Clean room explicitly. | 8/10 |
 | 2 | 🟡 MEDIUM | `crates/ai/src/ssh.rs` | 15–22 | `ssh_host` is not checked for a leading `-` and is placed before `--` in `ssh_line_args`, so a crafted value can be read as an ssh option. | 7/10 |
 | 3 | 🟡 MEDIUM | `crates/engine/src/tools/build_tools.rs` | 338–341 | `build_command_run` runs arbitrary shell (`cmd /C` / `sh -c`). In Auto mode the `commands` kind defaults to allow, so a builder can run any command as the user. | 9/10 |
-| 4 | 🟡 MEDIUM | `crates/platform/src/process.rs` | 124, 278–286 | Child processes inherit the full environment by default (`env_clear` is opt-in), so agent CLIs and MCP servers see API keys present in the environment. | 8/10 |
+| 4 | 🟡 MEDIUM | `crates/platform/src/process.rs` | 124, 278–286 | Child processes inherit the full environment by default (`env_clear` is opt-in), so agent CLIs and MCP servers see API keys present in the environment. Only `CLAUDE_*` variables are stripped (`cli_agents/mod.rs::host_session_vars`). | 9/10 |
 | 5 | ⚪ LOW | `crates/engines/src/assets/fal.rs` | 121–140 | Generated files are downloaded from whatever https URL the provider returns, with no host allowlist. | 7/10 |
 | 6 | ⚪ LOW | `crates/engine/src/tools/web_common.rs` | 192, 247 | A launched Chromium gets `--remote-allow-origins=*` on its CDP port. The port is loopback-only and ephemeral, so exposure is limited to local processes. | 7/10 |
 | 7 | ⚪ LOW | `crates/engine/src/tools/web_common.rs` | 205 | `--no-sandbox` is available as an opt-in browser flag (`no_sandbox`). | 9/10 |
 | 8 | ⚪ LOW | `crates/engines/src/game.rs` | 852–915 | Unity and Unreal installers are downloaded and then run, after an Authenticode publisher check. Godot's checksum comes from the same release over HTTPS, which catches a broken download but not a compromised release. | 8/10 |
+| 9 | 🟠 HIGH (fixed here) | `Cargo.lock` | `rustls-webpki` 0.103.15, `webpki-roots` 1.0.9 | Two live advisories in the certificate-verification path used by every HTTPS request: RUSTSEC-2026-0382 (accepts distrusted intermediates) and RUSTSEC-2026-0381 (bundled roots trust distrusted emSign intermediates). Both are in the default build via `ureq`. Fixed by updating to 0.103.16 and 1.0.11. | 10/10 |
+| 10 | 🟡 MEDIUM (open) | `Cargo.lock` | `rsa` 0.9.10, `crypto-bigint` 0.5.5 | RUSTSEC-2023-0071 (Marvin timing attack) and RUSTSEC-2026-0387 (timing variability). Reached through `formats` → `p256`/`ecdsa` for signature verification. No fixed version is reachable without a major-version bump; `deny.toml` already documents the rsa one. | 8/10 |
+| 11 | ⚪ LOW (open) | `Cargo.lock` | `wasmtime` 49.0.4 | Three advisories (RUSTSEC-2026-0422/0423/0424): a panic, cross-engine type confusion, and unchecked memory in component resource transfer. Only in builds with the optional `wasm-plugins` feature, which is off by default. Fixed in 49.0.5. | 9/10 |
 
 No CRITICAL findings.
+
+### What the tooling found, and what was done about it
+
+`cargo audit` reported 7 vulnerabilities and `cargo deny check` reported the same 7 plus 2 yanked
+crates. After the lockfile update in this branch:
+
+| Advisory | Crate | Status |
+|---|---|---|
+| RUSTSEC-2026-0382 | `rustls-webpki` 0.103.15 | **Fixed** → 0.103.16 |
+| RUSTSEC-2026-0381 | `webpki-roots` 1.0.9 | **Fixed** → 1.0.11 |
+| RUSTSEC-2026-0422/0423/0424 | `wasmtime` 49.0.4 | Open; optional feature only |
+| RUSTSEC-2023-0071 | `rsa` 0.9.10 | Open; documented in `deny.toml` |
+| RUSTSEC-2026-0387 | `crypto-bigint` 0.5.5 | Open; no compatible fix |
+| yanked | `clipboard-win` 5.4.1 | **Fixed** → 5.4.3 |
+| yanked | `async-executor` 1.14.0 | **Fixed** → 1.14.1 |
+
+`cargo build -p craft-anything-cli` passes with the updated lockfile.
+
+**Why finding 9 matters more than its advisory text suggests.** The previous review said "no TLS
+escape hatch" and stopped there. That was true and incomplete: the verifier itself was vulnerable.
+RUSTSEC-2026-0382 means a certificate chain containing a distrusted intermediate could be accepted,
+which is the exact failure mode a user assumes TLS prevents. It is fixed now, but it shows why
+"the code has no bypass" is not the same as "the connection is trustworthy" — the dependency
+versions matter as much as the code.
+
+### Dependency build scripts and proc-macros
+
+The previous review named this as a gap. It is now closed for the crates actually in the tree.
+
+- **53 dependency build scripts** were scanned for network, process, credential and filesystem
+  access. Every `Command::new` found invokes `rustc --version` (or `freebsd-version`, `emcc
+  -dumpversion`, `nasm`) to detect compiler features. None open a socket, read a credential file,
+  or write outside `OUT_DIR`.
+- **31 proc-macro crates** were scanned the same way. The only hits are `clap::Command::new`
+  (clap's own argument builder, not a process spawn), `rustversion` writing its detected version
+  to `OUT_DIR`, and `zerocopy-derive` writing test output when `ZEROCOPY_BLESS` is set. None
+  reach the network or a credential store.
+- This is a scan for the operations that could exfiltrate, not a line-by-line proof of every
+  crate. A build script could still be malicious in a way these patterns miss, and a proc-macro
+  runs arbitrary code by design. `--locked` plus a reviewed lockfile is the practical control.
 
 ## Why the keys are not being harvested
 
@@ -86,8 +134,9 @@ generated locally with no personal data in it.
   provider's human-readable error fields and never serialises the request. The journal redacts
   secret-named fields and credential-shaped tokens (`crates/engine/src/journal.rs`,
   `crates/analysis/src/standin.rs`).
-- **No TLS escape hatch.** `ureq` with `rustls` and `webpki-roots`; there is no
-  `danger_accept_invalid_certs` anywhere in the workspace.
+- **No TLS escape hatch in the code.** `ureq` with `rustls` and `webpki-roots`; there is no
+  `danger_accept_invalid_certs` anywhere in the workspace. This says nothing about the *version*
+  of the verifier — see finding 9, where the verifier itself was vulnerable until this branch.
 - **No `unsafe` in first-party code.** `crates/` and `apps/` contain no `unsafe` block, function,
   or impl; the workspace sets `unsafe_code = "forbid"` (`Cargo.toml:69`). The only `unsafe` in the
   tree is inside `vendor/wgpu-hal`, which is upstream wgpu code, not this project's.
@@ -121,7 +170,7 @@ the AI code alone. Re-run these to check it yourself.
 | UI image loading | `egui_extras` features | `svg` only. The `http` loader is off, so the UI cannot fetch an image from a URL. |
 | Telemetry | `telemetry`, `analytics`, `sentry`, `posthog`, `mixpanel`, `amplitude`, `update_check` | None (only detection tables and Aider's `--no-analytics`). |
 | Runtime-built URLs | `format!("https://…")`, `format!("{scheme}://…")` | The website target you type (`ui-egui/src/make.rs`), the Godot download (`engines/src/game.rs`), loopback test servers, and parsers of captured data. No URL is assembled from file contents or secrets. |
-| Build scripts | all `build.rs`, including `vendor/` | Four: font embedding, Windows resources (two apps), and the vendored `wgpu-hal`'s `cfg_aliases` block. None touch the network. (An earlier revision of this report omitted the vendored one.) |
+| Build scripts | all `build.rs`, including `vendor/` and every dependency | Four first-party: font embedding, Windows resources (two apps), and the vendored `wgpu-hal`'s `cfg_aliases` block. Plus 53 dependency build scripts, scanned: all invoke `rustc --version` or similar, none touch the network. |
 
 The six `ureq` call sites and where each URL comes from:
 
@@ -155,23 +204,28 @@ networking.
 what was not:
 
 - **Established:** in first-party source (`crates/`, `apps/`, `xtask/`; audited at `1f8508a`,
-  inventory re-run at `405de80`), every route to the network is listed above, and each goes to a
+  inventory re-run at `35e580e`), every route to the network is listed above, and each goes to a
   user-configured base URL or a pinned vendor host. No telemetry or credential-store access
   exists in that source.
-- **Not established — third-party crates.** `Cargo.lock` pins hundreds of crates.io dependencies;
-  they were checked for source (crates.io only, no git deps) but not read line by line. A
-  compromised dependency release is the realistic route for exfiltration in any Rust project.
+- **Established:** `cargo audit` and `cargo deny check` were run against the real lockfile, and
+  every dependency build script and proc-macro in the tree was scanned for network, process and
+  credential access. The two TLS advisories that mattered are fixed in this branch.
+- **Not established — third-party crates, line by line.** `Cargo.lock` pins hundreds of crates.io
+  dependencies. They were checked for source (crates.io only, no git deps) and their build scripts
+  and proc-macros were scanned, but their runtime code was not read line by line. A compromised
+  dependency release is the realistic route for exfiltration in any Rust project.
 - **Not established — the published binaries.** The release installers were not built from source
   here and compared. Only a binary you build yourself from this tree (`cargo build --release`)
   matches what was reviewed.
 - **Not established — other commits.** Later commits can change any of the above.
 - **Not established — a runtime trace.** No network capture was taken while a build ran.
 
-To get closer to certainty: build from source, run `cargo audit` and `cargo deny check` (the repo
-ships `deny.toml`), and watch outbound connections (Wireshark, or Windows Resource Monitor) while
-running a build. Expect connections only to the model host you configured. For keys specifically,
-prefer a provider key with a spend limit, and keep it in the OS keychain rather than the
-environment, because child processes inherit the environment (finding 4).
+To get closer to certainty: build from source with `--locked`, run `cargo audit` and `cargo deny
+check` yourself (both are now installed on this machine), and watch outbound connections
+(Wireshark, or Windows Resource Monitor) while running a build. Expect connections only to the
+model host you configured. For keys specifically, prefer a provider key with a spend limit, and
+keep it in the OS keychain rather than the environment, because child processes inherit the
+environment (finding 4).
 
 ## What the tool does to the machine
 
@@ -229,8 +283,20 @@ manifests. `Cargo.lock` pins versions and checksums, and `--locked` makes cargo 
 from it, which protects against a *later* tampered release but not against a crate that was
 malicious when locked. To reduce that risk: build with `--locked`, run `cargo deny check` and
 `cargo audit`, and for a high-stakes machine build inside a VM or container with no keys present.
+
 - `.githooks/pre-commit` runs `cargo xtask secrets`, which scans staged files for secret-shaped
   values and for this machine's own environment values.
+
+## Redirects and header forwarding
+
+A key can leak through a redirect even when the original host is trusted. Checked directly:
+
+- `ureq` 3.4.2 defaults to `RedirectAuthHeaders::Never` (`ureq/src/config.rs:952`), so
+  `authorization` and `x-api-key` are **not** re-sent when a request is redirected to another host.
+- No first-party agent overrides that setting: searching `crates/ai` and `crates/engines` for
+  `redirect`, `max_redirects` and `RedirectAuthHeaders` finds nothing.
+- The consequence: a hostile or compromised provider cannot bounce a request to a third party and
+  collect the key. It can still see the key itself, which is the documented caveat above.
 
 ## Recommendations
 
@@ -240,5 +306,11 @@ malicious when locked. To reduce that risk: build with `--locked`, run `cargo de
 3. Consider defaulting `commands` to `ask` in Auto mode, or documenting the current default more
    prominently (finding 3).
 4. Consider `env_clear` plus an explicit allowlist for agent CLI and MCP child processes, so keys
-   in the environment are not inherited by default (finding 4).
+   in the environment are not inherited by default (finding 4). Today only `CLAUDE_*` variables are
+   removed.
 5. Restrict fal's generated-file download to the provider's own media hosts (finding 5).
+6. **Keep the lockfile current.** Finding 9 was a live TLS vulnerability that a routine
+   `cargo update` fixed. Add `cargo audit` to CI so the next one is caught on the day it is
+   published rather than at the next review.
+7. Bump `wasmtime` to 49.0.5 for the three component-model advisories (finding 11), and revisit
+   `rsa`/`crypto-bigint` when a compatible release exists (finding 10).
