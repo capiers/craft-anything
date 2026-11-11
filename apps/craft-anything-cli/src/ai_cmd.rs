@@ -6,7 +6,7 @@ use clap::{Args, Subcommand};
 use craft_anything_ai::{AgentEvent, AiHub, BackendConfig, BackendKind, Effort};
 use craft_anything_evidence::ToolError;
 use serde_json::{Value, json};
-use std::io::{IsTerminal as _, Read as _, Write as _};
+use std::io::{BufRead as _, IsTerminal as _, Read as _, Write as _};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -46,8 +46,8 @@ pub enum AiCommand {
         /// Read the API key from this environment variable (keys are never taken on the command line).
         #[arg(long)]
         key_env: Option<String>,
-        /// Read the API key from stdin: paste it, then finish the input with Ctrl+Z then Enter
-        /// (Ctrl+D on macOS/Linux). A pipe or a file works too.
+        /// Read the API key from stdin: paste it and press Enter, or pipe it in
+        /// (`Get-Content key.txt | craft-anything-cli ai add ...`).
         #[arg(long)]
         key_stdin: bool,
     },
@@ -192,24 +192,30 @@ fn read_key(key_env: &Option<String>, key_stdin: bool) -> Result<Option<String>,
         return std::env::var(var).map(Some).map_err(|_| format!("environment variable {var} is not set"));
     }
     if key_stdin {
-        // A terminal would otherwise sit there looking hung: Enter sends a line, not end-of-file, and
-        // the read below waits for end-of-file. Say what to do when someone is watching.
+        // A key is one line, so one line is what we read: nobody should have to know how their
+        // terminal signals end-of-file. Reading further at a terminal would wait for input that
+        // never comes, which is what made this look hung.
         if std::io::stdin().is_terminal() {
-            let finish = if cfg!(windows) { "Ctrl+Z then Enter" } else { "Ctrl+D" };
-            eprint!("Paste the API key, then press {finish} to finish: ");
+            eprint!("Paste the API key and press Enter: ");
             let _ = std::io::stderr().flush();
         }
-        let mut s = String::new();
-        std::io::stdin().take(64 * 1024).read_to_string(&mut s).map_err(|e| format!("reading the key from stdin: {e}"))?;
-        let k = s.trim().to_string();
-        return if k.is_empty() {
-            let finish = if cfg!(windows) { "Ctrl+Z then Enter" } else { "Ctrl+D" };
-            Err(format!("no key on stdin. Paste the key and press {finish} to finish, or use --key-env <VARIABLE>."))
-        } else {
-            Ok(Some(k))
+        let read = std::io::stdin().take(64 * 1024);
+        let first = std::io::BufReader::new(read).lines().next();
+        let line = match first {
+            Some(Ok(l)) => l,
+            Some(Err(e)) => return Err(format!("reading the key from stdin: {e}")),
+            None => String::new(),
         };
+        return key_from_line(&line).map(Some);
     }
     Ok(None)
+}
+
+/// The key in the first line given on stdin: trimmed, and refused when empty. Anything after the
+/// first line is ignored, because a key is one line and a pipe may carry a whole file.
+fn key_from_line(line: &str) -> Result<String, String> {
+    let k = line.trim();
+    if k.is_empty() { Err("no key given. Paste the key and press Enter, or use --key-env <VARIABLE>.".to_string()) } else { Ok(k.to_string()) }
 }
 
 /// Dispatch AI configuration, discovery and model-selection commands through the shared hub.
@@ -419,4 +425,27 @@ pub fn doctor_checks() -> Vec<craft_anything_setup::Check> {
                 .fix(format!("Run `craft-anything-cli ai test {name}` for details.")),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::key_from_line;
+
+    /// The first line is the key, trimmed; a trailing newline or a whole piped file changes nothing.
+    #[test]
+    fn a_key_is_the_first_line_trimmed() {
+        assert_eq!(key_from_line("sk-test-key\n").unwrap(), "sk-test-key");
+        assert_eq!(key_from_line("  sk-test-key  ").unwrap(), "sk-test-key");
+        assert_eq!(key_from_line("sk-test-key\r\n").unwrap(), "sk-test-key");
+    }
+
+    /// An empty or whitespace-only line is refused, and the message says what to do (#5).
+    #[test]
+    fn an_empty_key_is_refused_with_what_to_do() {
+        for empty in ["", "   ", "\t\n"] {
+            let e = key_from_line(empty).unwrap_err();
+            assert!(e.contains("no key given"), "{e}");
+            assert!(e.contains("press Enter") && e.contains("--key-env"), "{e}");
+        }
+    }
 }
